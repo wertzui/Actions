@@ -43,9 +43,9 @@ on:
         default: 'main'
         type: string
     secrets:
-      nuget_user:
-        description: 'NuGet username for OIDC login (passed to NuGet/login).'
-        required: true
+      nuget_api_key:
+        description: 'Temporary NuGet API key produced by NuGet/login OIDC in the calling workflow.'
+        required: false
 
 jobs:
   build-test-pack-publish:
@@ -104,7 +104,7 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: wertzui/Actions/.github/actions/publish-dotnet-packages@main
         with:
-          nuget_user: ${{ secrets.nuget_user }}
+          nuget_api_key: ${{ secrets.nuget_api_key }}
 
       - name: Create GitHub release and upload nupkg files
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
