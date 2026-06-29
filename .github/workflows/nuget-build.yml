@@ -92,6 +92,7 @@ jobs:
 
       - name: Read version metadata
         id: read-versions
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: wertzui/DotnetVersionReader/.github/actions/read-dotnet-version@main
         with:
           input: ${{ inputs.solution_file }}
@@ -100,11 +101,13 @@ jobs:
 
       - name: Publish packages to NuGet
         id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: wertzui/DotnetVersionReader/.github/actions/publish-dotnet-packages@main
         with:
           nuget_user: ${{ secrets.nuget_user }}
 
       - name: Create GitHub release and upload nupkg files
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.read-versions.outputs.release_tag }}
