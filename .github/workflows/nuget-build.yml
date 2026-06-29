@@ -4,7 +4,7 @@ name: .NET Build, Test, Pack and Publish  to NuGet
 #
 #   jobs:
 #     release:
-#       uses: wertzui/DotnetVersionReader/.github/workflows/reusable-build-test-pack-publish.yml@main
+#       uses: wertzui/Actions/.github/workflows/nuget-build.yml@main
 #       with:
 #         solution_file: MySolution.slnx   # or .sln
 #       secrets:
@@ -75,7 +75,7 @@ jobs:
         run: dotnet build "${{ inputs.solution_file }}" -c Release --no-restore
 
       - name: Install dotnet-version
-        uses: wertzui/DotnetVersionReader/.github/actions/install-dotnet-version@main
+        uses: wertzui/Actions/.github/actions/install-dotnet-version@main
         with:
           version: ${{ inputs.tool_version }}
 
@@ -84,7 +84,7 @@ jobs:
         run: dotnet test "${{ inputs.solution_file }}" -c Release --no-build
 
       - name: Check version bumps against previous release tag
-        uses: wertzui/DotnetVersionReader/.github/actions/check-dotnet-version@main
+        uses: wertzui/Actions/.github/actions/check-dotnet-version@main
         with:
           input: ${{ inputs.solution_file }}
           base: ${{ inputs.base }}
@@ -93,7 +93,7 @@ jobs:
       - name: Read version metadata
         id: read-versions
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: wertzui/DotnetVersionReader/.github/actions/read-dotnet-version@main
+        uses: wertzui/Actions/.github/actions/read-dotnet-version@main
         with:
           input: ${{ inputs.solution_file }}
           filter: ${{ inputs.filter }}
@@ -102,7 +102,7 @@ jobs:
       - name: Publish packages to NuGet
         id: publish
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: wertzui/DotnetVersionReader/.github/actions/publish-dotnet-packages@main
+        uses: wertzui/Actions/.github/actions/publish-dotnet-packages@main
         with:
           nuget_user: ${{ secrets.nuget_user }}
 
