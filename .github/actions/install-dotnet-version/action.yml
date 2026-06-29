@@ -1,0 +1,53 @@
+name: 'Install dotnet-version'
+description: 'Makes the dotnet-version tool available on PATH, either by installing it from NuGet.org or by locating a locally built executable.'
+
+inputs:
+  version:
+    description: 'The version to install from NuGet.org. Leave empty for the latest stable release. Ignored when use_local_build is true.'
+    required: false
+    default: ''
+  use_local_build:
+    description: 'When true, skips the NuGet install and instead locates the dotnet-version executable that was already built in the workspace and adds its directory to PATH.'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install dotnet-version from NuGet
+      if: inputs.use_local_build != 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $version     = '${{ inputs.version }}'
+        $versionArgs = if ($version) { @('--version', $version) } else { @() }
+        $label       = if ($version) { "v$version" } else { 'latest' }
+
+        Write-Host "📦 Installing DotnetVersionReader ($label) from NuGet.org..."
+        dotnet tool install -g DotnetVersionReader @versionArgs
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "🔄 Already installed — updating to $label..."
+          dotnet tool update -g DotnetVersionReader @versionArgs
+        }
+        Write-Host "✅ dotnet-version is ready."
+
+    - name: Add locally built dotnet-version to PATH
+      if: inputs.use_local_build == 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $exeName = if ($IsWindows) { 'dotnet-version.exe' } else { 'dotnet-version' }
+        Write-Host "🔍 Searching workspace for $exeName..."
+
+        $exe = Get-ChildItem -Path . -Recurse -File |
+          Where-Object { $_.Name -eq $exeName } |
+          Sort-Object FullName |
+          Select-Object -First 1
+
+        if (-not $exe) { throw "❌ Could not find $exeName in the workspace. Did the build succeed?" }
+
+        Write-Host "✅ Found: $($exe.FullName)"
+        Write-Host "📁 Adding $($exe.DirectoryName) to PATH"
+        $exe.DirectoryName >> $env:GITHUB_PATH
