@@ -1,0 +1,70 @@
+name: 'Decrypt a value'
+description: >-
+  Decrypts a Base64 ciphertext produced by the encrypt-value action using the
+  same passphrase, recovering the original plaintext. The decrypted value is
+  registered as a GitHub secret mask (::add-mask::) so it is redacted from logs,
+  while still being usable by subsequent steps via the 'decrypted' output.
+
+inputs:
+  encrypted:
+    description: 'Base64-encoded ciphertext blob produced by the encrypt-value action.'
+    required: true
+  key:
+    description: 'The passphrase used to derive the encryption key. Must match the one used to encrypt.'
+    required: true
+
+outputs:
+  decrypted:
+    description: 'The recovered plaintext value (masked in logs).'
+    value: ${{ steps.decrypt.outputs.decrypted }}
+
+runs:
+  using: composite
+  steps:
+    - name: Decrypt value
+      id: decrypt
+      shell: pwsh
+      env:
+        DEC_VALUE: ${{ inputs.encrypted }}
+        DEC_KEY: ${{ inputs.key }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $encoded = $env:DEC_VALUE
+        $pass    = $env:DEC_KEY
+
+        if ([string]::IsNullOrEmpty($pass)) {
+          throw "❌ Decryption key is empty. Provide a non-empty 'key' input."
+        }
+        if ([string]::IsNullOrEmpty($encoded)) {
+          throw "❌ Encrypted value is empty. Provide a non-empty 'encrypted' input."
+        }
+
+        $blob = [Convert]::FromBase64String($encoded)
+        if ($blob.Length -lt 44) {
+          throw "❌ Encrypted blob is too short to be valid (expected salt+nonce+tag+ciphertext)."
+        }
+
+        # Unpack salt(16) || nonce(12) || tag(16) || ciphertext(rest).
+        $salt  = [byte[]]::new(16);  [Array]::Copy($blob, 0,  $salt,  0, 16)
+        $nonce = [byte[]]::new(12);  [Array]::Copy($blob, 16, $nonce, 0, 12)
+        $tag   = [byte[]]::new(16);  [Array]::Copy($blob, 28, $tag,   0, 16)
+        $cipherLen = $blob.Length - 44
+        $cipher = [byte[]]::new($cipherLen); [Array]::Copy($blob, 44, $cipher, 0, $cipherLen)
+
+        # Derive the same 256-bit key from the passphrase using PBKDF2-SHA256.
+        $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+          $pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        try { $key = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
+
+        # AES-256-GCM authenticated decryption (throws if the tag does not verify).
+        $plainBytes = [byte[]]::new($cipher.Length)
+        $aes = [System.Security.Cryptography.AesGcm]::new($key, 16)
+        try { $aes.Decrypt($nonce, $cipher, $tag, $plainBytes) } finally { $aes.Dispose() }
+
+        $plain = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+
+        # Mask the recovered secret in all subsequent logs, then expose it as an output.
+        Write-Host "::add-mask::$plain"
+        Write-Host "🔓 Decrypted value successfully ($($plainBytes.Length) bytes)."
+        "decrypted=$plain" >> $env:GITHUB_OUTPUT

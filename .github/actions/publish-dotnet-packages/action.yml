@@ -1,5 +1,5 @@
 name: 'Publish .NET packages to NuGet'
-description: 'Collects .nupkg and .snupkg files, logs in to NuGet via OIDC, and publishes all packages. Outputs the list of package files for use in a subsequent GitHub release step.'
+description: 'Collects .nupkg and .snupkg files and publishes all packages to NuGet.org using the supplied API key. Outputs the list of package files for use in a subsequent GitHub release step.'
 
 inputs:
   nuget_api_key:

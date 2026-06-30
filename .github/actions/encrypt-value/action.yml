@@ -1,0 +1,73 @@
+name: 'Encrypt a value'
+description: >-
+  Encrypts a (possibly secret) string with AES-256-GCM using a passphrase, and
+  returns the ciphertext as a Base64 string. The ciphertext is NOT a registered
+  GitHub secret, so it survives being passed between jobs and reusable workflows
+  without being masked/redacted to an empty string. Pair with the
+  decrypt-value action to recover the original value where it is needed.
+
+inputs:
+  value:
+    description: 'The plaintext value to encrypt (e.g. a temporary API key).'
+    required: true
+  key:
+    description: 'The passphrase used to derive the encryption key. Store this as a secret.'
+    required: true
+
+outputs:
+  encrypted:
+    description: 'Base64-encoded ciphertext blob (salt || nonce || tag || ciphertext).'
+    value: ${{ steps.encrypt.outputs.encrypted }}
+
+runs:
+  using: composite
+  steps:
+    - name: Encrypt value
+      id: encrypt
+      shell: pwsh
+      env:
+        ENC_VALUE: ${{ inputs.value }}
+        ENC_KEY: ${{ inputs.key }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $plain = $env:ENC_VALUE
+        $pass  = $env:ENC_KEY
+
+        if ([string]::IsNullOrEmpty($pass)) {
+          throw "❌ Encryption key is empty. Provide a non-empty 'key' input."
+        }
+        if ([string]::IsNullOrEmpty($plain)) {
+          throw "❌ Value to encrypt is empty. Provide a non-empty 'value' input."
+        }
+
+        $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+
+        # Random salt (for PBKDF2) and nonce (for AES-GCM).
+        $salt  = [byte[]]::new(16)
+        $nonce = [byte[]]::new(12)
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
+
+        # Derive a 256-bit key from the passphrase using PBKDF2-SHA256.
+        $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+          $pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        try { $key = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
+
+        # AES-256-GCM authenticated encryption.
+        $cipher = [byte[]]::new($plainBytes.Length)
+        $tag    = [byte[]]::new(16)
+        $aes = [System.Security.Cryptography.AesGcm]::new($key, 16)
+        try { $aes.Encrypt($nonce, $plainBytes, $cipher, $tag) } finally { $aes.Dispose() }
+
+        # Pack salt || nonce || tag || ciphertext and Base64-encode.
+        $blob = [byte[]]::new($salt.Length + $nonce.Length + $tag.Length + $cipher.Length)
+        [Array]::Copy($salt,   0, $blob, 0, $salt.Length)
+        [Array]::Copy($nonce,  0, $blob, $salt.Length, $nonce.Length)
+        [Array]::Copy($tag,    0, $blob, $salt.Length + $nonce.Length, $tag.Length)
+        [Array]::Copy($cipher, 0, $blob, $salt.Length + $nonce.Length + $tag.Length, $cipher.Length)
+
+        $encoded = [Convert]::ToBase64String($blob)
+
+        Write-Host "🔒 Encrypted value ($($plainBytes.Length) bytes -> $($encoded.Length) Base64 chars)."
+        "encrypted=$encoded" >> $env:GITHUB_OUTPUT

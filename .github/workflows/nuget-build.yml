@@ -1,19 +1,39 @@
 name: .NET Build, Test, Pack and Publish  to NuGet
 
-# Reusable workflow. Call it from any repository with:
+# Reusable workflow. The calling workflow performs the NuGet OIDC login itself
+# (so the OIDC token is issued for the caller's repository), encrypts the
+# short-lived API key with the encrypt-value action, and passes the ciphertext
+# in. This reusable workflow decrypts it just before publishing. Encrypting the
+# key is necessary because GitHub masks raw secret values to '' when they cross
+# job / reusable-workflow boundaries.
 #
 #   jobs:
+#     login:
+#       runs-on: ubuntu-latest
+#       permissions:
+#         id-token: write
+#       outputs:
+#         encrypted_api_key: ${{ steps.encrypt.outputs.encrypted }}
+#       steps:
+#         - id: login
+#           uses: NuGet/login@v1
+#           with: { user: ${{ secrets.NUGET_USER }} }
+#         - id: encrypt
+#           uses: wertzui/Actions/.github/actions/encrypt-value@main
+#           with:
+#             value: ${{ steps.login.outputs.NUGET_API_KEY }}
+#             key: ${{ secrets.ENCRYPTION_KEY }}
+#
 #     release:
+#       needs: login
+#       permissions:
+#         contents: write
 #       uses: wertzui/Actions/.github/workflows/nuget-build.yml@main
 #       with:
 #         solution_file: MySolution.slnx   # or .sln
+#         encrypted_api_key: ${{ needs.login.outputs.encrypted_api_key }}
 #       secrets:
-#         nuget_user: ${{ secrets.NUGET_USER }}
-#
-# Required permissions in the calling workflow job:
-#   permissions:
-#     contents: write    # push git tags and create GitHub releases
-#     id-token: write    # NuGet OIDC login
+#         encryption_key: ${{ secrets.ENCRYPTION_KEY }}
 
 on:
   workflow_call:
@@ -42,9 +62,14 @@ on:
         required: false
         default: 'main'
         type: string
+      encrypted_api_key:
+        description: 'AES-256-GCM encrypted NuGet API key (Base64) produced by the encrypt-value action in the calling workflow.'
+        required: false
+        default: ''
+        type: string
     secrets:
-      nuget_api_key:
-        description: 'Temporary NuGet API key produced by NuGet/login OIDC in the calling workflow.'
+      encryption_key:
+        description: 'Passphrase used to decrypt encrypted_api_key (must match the one used to encrypt).'
         required: false
 
 jobs:
@@ -98,12 +123,20 @@ jobs:
           filter: ${{ inputs.filter }}
           create_tags: 'true'
 
+      - name: Decrypt NuGet API key
+        id: decrypt
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: wertzui/Actions/.github/actions/decrypt-value@main
+        with:
+          encrypted: ${{ inputs.encrypted_api_key }}
+          key: ${{ secrets.encryption_key }}
+
       - name: Publish packages to NuGet
         id: publish
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: wertzui/Actions/.github/actions/publish-dotnet-packages@main
         with:
-          nuget_api_key: ${{ secrets.nuget_api_key }}
+          nuget_api_key: ${{ steps.decrypt.outputs.decrypted }}
 
       - name: Create GitHub release and upload nupkg files
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
