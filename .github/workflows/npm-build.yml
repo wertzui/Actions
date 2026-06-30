@@ -1,0 +1,287 @@
+name: Node Build, Test, Pack and Publish to npm
+
+# Reusable workflow. Publishes npm packages using OIDC trusted publishing by
+# default — no token and no encrypt/decrypt key hand-off is required.
+#
+# Why this is simpler than the NuGet reusable workflow:
+#   npm trusted publishing validates OIDC against the CALLING (top-level)
+#   workflow, not the reusable workflow that actually runs `npm publish`. So you
+#   add your real caller workflow (this repo + its entry workflow filename) as
+#   the Trusted Publisher on npmjs.com — the reusable workflow itself is never
+#   trusted. NuGet binds OIDC to the reusable workflow (job_workflow_ref), which
+#   is why nuget-build.yml has to mint the key in the caller and smuggle it in
+#   via encrypt-value/decrypt-value. npm avoids that entirely.
+#
+# Requirements for OIDC:
+#   * `id-token: write` must be granted by the CALLER job (below) AND is declared
+#     on this workflow's job — both are required.
+#   * A Trusted Publisher must be configured for each package on npmjs.com,
+#     pointing at the caller repository and the caller's entry workflow filename.
+#   * `package.json`'s `repository.url` must match the caller's GitHub repo.
+#
+#   jobs:
+#     release:
+#       permissions:
+#         contents: write   # push git tags and create GitHub releases
+#         id-token: write   # npm OIDC trusted publishing + provenance
+#       uses: wertzui/Actions/.github/workflows/npm-build.yml@main
+#       with:
+#         working_directory: .
+#       # secrets:
+#       #   npm_token: ${{ secrets.NPM_TOKEN }}   # optional — omit to use OIDC
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version to set up.'
+        required: false
+        default: '22.x'
+        type: string
+      working_directory:
+        description: 'Directory to run install/build/test in and to search for publishable packages.'
+        required: false
+        default: '.'
+        type: string
+      registry:
+        description: 'npm registry URL to publish to.'
+        required: false
+        default: 'https://registry.npmjs.org'
+        type: string
+      access:
+        description: "Access for scoped packages: 'public' or 'restricted'."
+        required: false
+        default: 'public'
+        type: string
+      provenance:
+        description: "Publish with provenance (requires id-token: write)."
+        required: false
+        default: 'true'
+        type: string
+      base:
+        description: 'Git ref to compare versions against for the version-bump check (pull requests only).'
+        required: false
+        default: 'main'
+        type: string
+      install_command:
+        description: 'Command used to install dependencies.'
+        required: false
+        default: 'npm ci'
+        type: string
+      build_command:
+        description: 'Command used to build the package(s). Runs only if it succeeds being present.'
+        required: false
+        default: 'npm run build --if-present'
+        type: string
+      test_command:
+        description: 'Command used to run tests.'
+        required: false
+        default: 'npm test'
+        type: string
+    secrets:
+      npm_token:
+        description: 'Optional npm token. When omitted, OIDC trusted publishing is used.'
+        required: false
+
+jobs:
+  build-test-pack-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          registry-url: ${{ inputs.registry }}
+
+      - name: Install dependencies
+        shell: pwsh
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+
+      - name: Build
+        shell: pwsh
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.build_command }}
+
+      - name: Test
+        shell: pwsh
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.test_command }}
+
+      - name: Check version bumps against base ref
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          BASE: ${{ inputs.base }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Compare-SemVer([string]$a, [string]$b) {
+            $ac = ($a -replace '[-+].*$', '').Split('.')
+            $bc = ($b -replace '[-+].*$', '').Split('.')
+            for ($i = 0; $i -lt 3; $i++) {
+              $x = [int]($(if ($i -lt $ac.Count) { $ac[$i] } else { '0' }))
+              $y = [int]($(if ($i -lt $bc.Count) { $bc[$i] } else { '0' }))
+              if ($x -ne $y) { return [math]::Sign($x - $y) }
+            }
+            $ap = if ($a -match '-(.+)$') { $Matches[1] } else { '' }
+            $bp = if ($b -match '-(.+)$') { $Matches[1] } else { '' }
+            if ($ap -eq $bp) { return 0 }
+            if ([string]::IsNullOrEmpty($ap)) { return 1 }   # release > prerelease
+            if ([string]::IsNullOrEmpty($bp)) { return -1 }
+            return [math]::Sign([string]::Compare($ap, $bp))
+          }
+
+          $root = Resolve-Path -LiteralPath $env:WORKING_DIRECTORY
+          Push-Location $root
+          try {
+            $manifests = Get-ChildItem -Recurse -File -Filter 'package.json' |
+              Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+
+            $packages = foreach ($m in $manifests) {
+              try { $j = Get-Content -LiteralPath $m.FullName -Raw | ConvertFrom-Json } catch { continue }
+              if (-not $j.name -or -not $j.version -or $j.private -eq $true) { continue }
+              $rel = (Resolve-Path -LiteralPath $m.FullName -Relative) -replace '^\.[\\/]', '' -replace '\\', '/'
+              [PSCustomObject]@{ Name = $j.name; Version = $j.version; RelPath = $rel }
+            }
+
+            if (-not $packages) { throw "❌ No publishable package.json files were found." }
+
+            $base = $env:BASE
+            git fetch origin $base --depth=1 2>$null | Out-Null
+
+            $failed = New-Object System.Collections.Generic.List[string]
+            foreach ($p in $packages) {
+              $content = git show "FETCH_HEAD:$($p.RelPath)" 2>$null
+              if (-not $content) { $content = git show "${base}:$($p.RelPath)" 2>$null }
+
+              if (-not $content) {
+                Write-Host "🆕 $($p.Name): new package (no version at base) — OK"
+                continue
+              }
+
+              try { $baseVersion = ($content | ConvertFrom-Json).version } catch { $baseVersion = $null }
+              if (-not $baseVersion) {
+                Write-Host "🆕 $($p.Name): unreadable base version — OK"
+                continue
+              }
+
+              if ((Compare-SemVer $p.Version $baseVersion) -gt 0) {
+                Write-Host "✅ $($p.Name): $baseVersion → $($p.Version)"
+              } else {
+                Write-Host "❌ $($p.Name): $baseVersion → $($p.Version) (not bumped)"
+                $failed.Add("$($p.Name): $baseVersion → $($p.Version)")
+              }
+            }
+
+            $title = if ($failed.Count -gt 0) { '## ❌ Version bump required before publish' } else { '## ✅ Version bump check passed' }
+            $title >> $env:GITHUB_STEP_SUMMARY
+            ''      >> $env:GITHUB_STEP_SUMMARY
+            foreach ($p in $packages) { "- $($p.Name) $($p.Version)" >> $env:GITHUB_STEP_SUMMARY }
+
+            if ($failed.Count -gt 0) {
+              Write-Host "::error::One or more npm packages require a version bump before publishing."
+              exit 1
+            }
+            Write-Host "✅ All package versions are correctly bumped."
+          } finally {
+            Pop-Location
+          }
+
+      - name: Read versions and create tags
+        id: versions
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $root = Resolve-Path -LiteralPath $env:WORKING_DIRECTORY
+          $manifests = Get-ChildItem -Path $root -Recurse -File -Filter 'package.json' |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+
+          $packages = foreach ($m in $manifests) {
+            try { $j = Get-Content -LiteralPath $m.FullName -Raw | ConvertFrom-Json } catch { continue }
+            if (-not $j.name -or -not $j.version -or $j.private -eq $true) { continue }
+            [PSCustomObject]@{ Name = $j.name; Version = $j.version }
+          }
+
+          if (-not $packages) { throw "❌ No publishable package.json files were found." }
+
+          Write-Host "📦 Found $($packages.Count) publishable package(s):"
+          $packages | ForEach-Object { Write-Host "   • $($_.Name)@$($_.Version)" }
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          $tagList = New-Object System.Collections.Generic.List[string]
+          foreach ($p in $packages) {
+            $raw  = "$($p.Name)-v$($p.Version)"
+            $safe = (($raw -replace '[^0-9A-Za-z._/-]', '-').Trim('-/'))
+            if (-not $tagList.Contains($safe)) { $tagList.Add($safe) }
+          }
+
+          Write-Host "🏷️  Tagging commit with $($tagList.Count) package tag(s)..."
+          foreach ($tag in $tagList) {
+            if (git tag -l $tag) { Write-Host "⏭️  Tag already exists, skipping: $tag"; continue }
+            git tag -a $tag -m "Release $tag"
+            git push origin $tag
+          }
+
+          $summaryParts  = @($packages | ForEach-Object { "$($_.Name) $($_.Version)" })
+          $releaseName   = "Release: " + ($summaryParts -join ', ')
+          $releaseTagRaw = "release-" + (($packages | ForEach-Object { "$($_.Name)-v$($_.Version)" }) -join '__')
+          $releaseTag    = ($releaseTagRaw -replace '[^0-9A-Za-z._/-]', '-')
+          if ($releaseTag.Length -gt 200) { $releaseTag = "release-$env:RUN_NUMBER-$env:SHA" }
+
+          if (-not (git tag -l $releaseTag)) {
+            Write-Host "🚀 Creating release tag: $releaseTag"
+            git tag -a $releaseTag -m $releaseName
+            git push origin $releaseTag
+          } else {
+            Write-Host "⏭️  Release tag already exists, skipping: $releaseTag"
+          }
+
+          $body       = @("Packages in this release:") + ($packages | ForEach-Object { "- $($_.Name) $($_.Version)" })
+          $bodyJoined = $body -join "`n"
+
+          "release_tag=$releaseTag"   >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+          "release_body<<EOF" >> $env:GITHUB_OUTPUT
+          $bodyJoined         >> $env:GITHUB_OUTPUT
+          "EOF"               >> $env:GITHUB_OUTPUT
+
+      - name: Publish packages to npm
+        id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: wertzui/Actions/.github/actions/publish-npm-packages@main
+        with:
+          npm_token: ${{ secrets.npm_token }}
+          registry: ${{ inputs.registry }}
+          access: ${{ inputs.access }}
+          provenance: ${{ inputs.provenance }}
+          working_directory: ${{ inputs.working_directory }}
+
+      - name: Create GitHub release and upload tarballs
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.versions.outputs.release_tag }}
+          name: ${{ steps.versions.outputs.release_name }}
+          body: ${{ steps.versions.outputs.release_body }}
+          files: ${{ steps.publish.outputs.package_files }}
