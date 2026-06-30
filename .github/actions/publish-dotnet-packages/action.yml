@@ -66,4 +66,18 @@ runs:
             dotnet nuget push "$($snupkg.FullName)" --api-key "$env:NUGET_API_KEY" --source "https://api.nuget.org/v3/index.json" --skip-duplicate
           }
         }
+        Write-Host ""
+        Write-Host "📋 Published packages:"
+        foreach ($pkg in $pkgs) {
+          $baseName = $pkg.BaseName  # e.g. MyPackage.1.2.3
+          # Split on the first segment that looks like a version (starts with a digit)
+          if ($baseName -match '^(.+?)\.(\d+\..*)$') {
+            $pkgId      = $Matches[1]
+            $pkgVersion = $Matches[2]
+            Write-Host "   • $pkgId $pkgVersion → https://www.nuget.org/packages/$pkgId/$pkgVersion"
+          } else {
+            Write-Host "   • $($pkg.Name)"
+          }
+        }
+        Write-Host ""
         Write-Host "✅ All packages published successfully."
