@@ -1,0 +1,233 @@
+name: 'Publish npm packages'
+description: >-
+  Discovers publishable package.json files, packs each into a .tgz tarball, and
+  publishes all packages to the npm registry. Authenticates via npm OIDC trusted
+  publishing by default (no secret required — just id-token: write and a Trusted
+  Publisher configured on npmjs.com) or via an optional npm token. Outputs the
+  list of packed tarballs for use in a subsequent GitHub release step.
+
+inputs:
+  npm_token:
+    description: >-
+      npm automation or granular access token. Leave empty to authenticate via
+      OIDC trusted publishing (recommended), which requires id-token: write on
+      the job and a Trusted Publisher configured for the package on npmjs.com.
+    required: false
+    default: ''
+  registry:
+    description: 'npm registry URL to publish to.'
+    required: false
+    default: 'https://registry.npmjs.org'
+  access:
+    description: "Package access for scoped packages: 'public' or 'restricted'."
+    required: false
+    default: 'public'
+  provenance:
+    description: >-
+      When 'true', publish with --provenance (requires id-token: write). Ignored
+      for dry runs. With OIDC trusted publishing, provenance is generated
+      automatically regardless of this flag.
+    required: false
+    default: 'true'
+  dry_run:
+    description: "When 'true', run 'npm publish --dry-run' without actually publishing."
+    required: false
+    default: 'false'
+  working_directory:
+    description: 'Root directory to search recursively for publishable package.json files.'
+    required: false
+    default: '.'
+
+outputs:
+  package_files:
+    description: 'Newline-separated list of all packed .tgz tarball paths that were published.'
+    value: ${{ steps.collect.outputs.package_files }}
+  published_packages:
+    description: 'Newline-separated list of published packages in "name@version" format.'
+    value: ${{ steps.collect.outputs.published_packages }}
+
+runs:
+  using: composite
+  steps:
+    - name: Collect and pack npm packages
+      id: collect
+      shell: pwsh
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $root = Resolve-Path -LiteralPath $env:WORKING_DIRECTORY
+        Write-Host "🔍 Searching for publishable package.json files under '$root'..."
+
+        # Find every package.json, excluding anything under a node_modules folder.
+        $manifests = Get-ChildItem -Path $root -Recurse -File -Filter 'package.json' |
+          Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+
+        $packages = New-Object System.Collections.Generic.List[object]
+        foreach ($manifest in $manifests) {
+          try {
+            $json = Get-Content -LiteralPath $manifest.FullName -Raw | ConvertFrom-Json
+          } catch {
+            Write-Host "   ⚠️  Skipping unreadable manifest: $($manifest.FullName)"
+            continue
+          }
+
+          if (-not $json.name -or -not $json.version) {
+            continue  # Not a real package (e.g. a config/lock helper).
+          }
+          if ($json.private -eq $true) {
+            Write-Host "   ⏭️  Skipping private package: $($json.name)"
+            continue
+          }
+
+          $packages.Add([PSCustomObject]@{
+            Name      = $json.name
+            Version   = $json.version
+            Directory = $manifest.Directory.FullName
+          })
+        }
+
+        if ($packages.Count -eq 0) {
+          throw "❌ No publishable package.json files were found. Did the build run, and are the packages non-private?"
+        }
+
+        Write-Host "📦 Found $($packages.Count) publishable package(s):"
+        $packages | ForEach-Object { Write-Host "   • $($_.Name)@$($_.Version)" }
+
+        # Pack each package into a staging directory so we have concrete file
+        # artifacts (mirrors how the NuGet action collects .nupkg files).
+        $staging = Join-Path ([System.IO.Path]::GetTempPath()) "npm-pack-$([System.Guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+
+        $tarballs    = New-Object System.Collections.Generic.List[string]
+        $identifiers = New-Object System.Collections.Generic.List[string]
+        foreach ($pkg in $packages) {
+          Write-Host "   🗜️  Packing $($pkg.Name)@$($pkg.Version)"
+          $packOutput = npm pack "$($pkg.Directory)" --pack-destination "$staging" --json 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "❌ 'npm pack' failed for $($pkg.Name): $packOutput"
+          }
+
+          $tarballName = ($packOutput | ConvertFrom-Json)[0].filename
+          $tarballPath = Join-Path $staging $tarballName
+          if (-not (Test-Path -LiteralPath $tarballPath)) {
+            throw "❌ Expected tarball not found after packing $($pkg.Name): $tarballPath"
+          }
+
+          $tarballs.Add($tarballPath)
+          $identifiers.Add("$($pkg.Name)@$($pkg.Version)")
+        }
+
+        $tarballsJoined    = $tarballs -join "`n"
+        $identifiersJoined = $identifiers -join "`n"
+
+        "package_files<<EOF"     >> $env:GITHUB_OUTPUT
+        $tarballsJoined          >> $env:GITHUB_OUTPUT
+        "EOF"                    >> $env:GITHUB_OUTPUT
+
+        "published_packages<<EOF" >> $env:GITHUB_OUTPUT
+        $identifiersJoined        >> $env:GITHUB_OUTPUT
+        "EOF"                     >> $env:GITHUB_OUTPUT
+
+    - name: Publish packages to npm
+      shell: pwsh
+      env:
+        NPM_TOKEN: ${{ inputs.npm_token }}
+        REGISTRY: ${{ inputs.registry }}
+        ACCESS: ${{ inputs.access }}
+        PROVENANCE: ${{ inputs.provenance }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        PACKAGE_FILES: ${{ steps.collect.outputs.package_files }}
+        PUBLISHED_PACKAGES: ${{ steps.collect.outputs.published_packages }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $tarballs = @($env:PACKAGE_FILES -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if (-not $tarballs) {
+          throw "❌ No packed tarballs found to publish."
+        }
+
+        $registry  = $env:REGISTRY.TrimEnd('/')
+        $usingOidc = [string]::IsNullOrEmpty($env:NPM_TOKEN)
+        $isDryRun  = $env:DRY_RUN -eq 'true'
+
+        # --- Authentication setup -------------------------------------------------
+        # Write a throwaway npmrc (via NPM_CONFIG_USERCONFIG) so we never touch the
+        # repository's own .npmrc. For OIDC we only need the registry configured;
+        # the npm CLI performs the token exchange itself at publish time.
+        $npmrc = Join-Path ([System.IO.Path]::GetTempPath()) "publish-$([System.Guid]::NewGuid().ToString('N')).npmrc"
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add("registry=$registry/")
+        $lines.Add("always-auth=true")
+
+        if (-not $usingOidc) {
+          # Token auth: reference NODE_AUTH_TOKEN so the raw token never lands on disk.
+          $registryHost = ([System.Uri]$registry).Authority
+          $lines.Add("//$registryHost/:_authToken=`${NODE_AUTH_TOKEN}")
+          $env:NODE_AUTH_TOKEN = $env:NPM_TOKEN
+          Write-Host "🔑 Authenticating to $registry using an npm token."
+        } else {
+          Write-Host "🪪 No token supplied — using OIDC trusted publishing against $registry."
+          Write-Host "   (Requires 'id-token: write' on this job and a Trusted Publisher configured on the registry.)"
+        }
+
+        Set-Content -LiteralPath $npmrc -Value $lines -Encoding utf8
+        $env:NPM_CONFIG_USERCONFIG = $npmrc
+
+        # --- npm version guard for OIDC ------------------------------------------
+        # OIDC trusted publishing requires npm >= 11.5.1. Upgrade if the runner ships
+        # something older so the publish doesn't silently fall back / fail.
+        if ($usingOidc) {
+          $npmVersion = (npm --version).Trim()
+          Write-Host "ℹ️  npm version: $npmVersion"
+          $required = [Version]'11.5.1'
+          $current  = [Version]($npmVersion -replace '-.*$', '')
+          if ($current -lt $required) {
+            Write-Host "⬆️  Upgrading npm to satisfy the OIDC minimum ($required)..."
+            npm install -g npm@latest
+            if ($LASTEXITCODE -ne 0) { throw "❌ Failed to upgrade npm for OIDC publishing." }
+            Write-Host "ℹ️  npm version is now: $((npm --version).Trim())"
+          }
+        }
+
+        # --- Publish --------------------------------------------------------------
+        $commonArgs = @('--access', $env:ACCESS, '--registry', "$registry/")
+        if ($isDryRun) {
+          $commonArgs += '--dry-run'
+          Write-Host "🧪 Dry run enabled — packages will NOT actually be published."
+        } elseif ($env:PROVENANCE -eq 'true') {
+          # Provenance needs id-token: write; skipped for dry runs to avoid noise.
+          $commonArgs += '--provenance'
+        }
+
+        Write-Host "🚀 Publishing $($tarballs.Count) package(s) to $registry..."
+        foreach ($tarball in $tarballs) {
+          Write-Host "   📤 Publishing $(Split-Path $tarball -Leaf)"
+          npm publish "$tarball" @commonArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "❌ 'npm publish' failed for $tarball."
+          }
+        }
+
+        # --- Summary --------------------------------------------------------------
+        Write-Host ""
+        Write-Host "📋 Published packages:"
+        foreach ($id in @($env:PUBLISHED_PACKAGES -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+          # $id is "name@version"; split on the LAST '@' so scoped names (@scope/pkg) survive.
+          $at = $id.LastIndexOf('@')
+          if ($at -gt 0) {
+            $name    = $id.Substring(0, $at)
+            $version = $id.Substring($at + 1)
+            Write-Host "   • $name $version → https://www.npmjs.com/package/$name/v/$version"
+          } else {
+            Write-Host "   • $id"
+          }
+        }
+        Write-Host ""
+
+        if ($isDryRun) {
+          Write-Host "✅ Dry run completed successfully (nothing was published)."
+        } else {
+          Write-Host "✅ All packages published successfully."
+        }
